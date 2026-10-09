@@ -1,0 +1,15 @@
+# ============ 环境与依赖 ============
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ============ 密钥：绝对不能进仓库 ============
+config.local.json
+.env
+
+# ============ 运行时产物 ============
+temp/
+*.log
+logs/
+data/recordings/
