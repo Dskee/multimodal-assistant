@@ -24,6 +24,7 @@ from config import (
     TTS_SILICONFLOW_MODEL,
     TTS_SILICONFLOW_VOICE,
     DEFAULT_LOCAL_VOICE,
+    DEFAULT_SPEECH_RATE,
     TTS_LOCAL_SERVICE,
     TTS_SILICONFLOW,
 )
@@ -37,16 +38,23 @@ class TextToSound:
         audio_bytes = await tts.run("你好")
     """
 
-    def __init__(self, provider=None, voice=None, api_key=None):
+    def __init__(self, provider=None, voice=None, api_key=None, rate=None):
         """
         初始化
         :param provider: 提供商：TTS_LOCAL_SERVICE 或 TTS_SILICONFLOW
         :param voice: 音色名称
         :param api_key: 云端 API Key（不填用 config 默认）
+        :param rate: 语速（edge-tts 语法，如 "-10%"）；适老化默认放慢
         """
         self.provider = provider if provider else TTS_LOCAL_SERVICE
         self.voice = voice if voice else DEFAULT_LOCAL_VOICE
         self.api_key = api_key if api_key else API_KEY
+        self.rate = rate if rate else DEFAULT_SPEECH_RATE
+
+    def set_api_key(self, key):
+        """换 Key 时同时丢弃已缓存的云端客户端，否则新 Key 不生效"""
+        self.api_key = key or ""
+        self._silicon_client = None
 
         # 云端客户端（延迟初始化）
         self._silicon_client = None
@@ -88,7 +96,7 @@ class TextToSound:
         communicate = edge_tts.Communicate(
             text=text,
             voice=self.voice,
-            rate="+0%",
+            rate=self.rate,
             pitch="+0Hz",
             volume="+0%",
         )

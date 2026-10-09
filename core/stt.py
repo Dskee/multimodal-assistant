@@ -11,7 +11,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from openai import OpenAI
-from config import API_KEY, BASE_URL, STT_MODEL
+from config import API_KEY, BASE_URL, STT_MODEL, ASR_TIMEOUT_SECONDS
 
 
 class SoundToText:
@@ -28,9 +28,18 @@ class SoundToText:
         :param api_key: 硅基流动 API Key，不填则用 config.py 中的默认值
         """
         self.api_key = api_key if api_key else API_KEY
-        # 同步客户端
-        self.client = OpenAI(api_key=self.api_key, base_url=BASE_URL)
+        # 同步客户端。
+        # 必须带超时：实测 ASR 延迟抖动很大（稳态 0.2~0.4 秒，但出现过 60 秒以上），
+        # 不设超时时 SDK 默认 600 秒，一次卡住就把整条连续对话链路挂死。
+        self.client = OpenAI(api_key=self.api_key, base_url=BASE_URL,
+                             timeout=ASR_TIMEOUT_SECONDS, max_retries=0)
         self.model = STT_MODEL
+
+    def set_api_key(self, key):
+        """换 Key 时重建客户端（只改 self.api_key 不会生效）"""
+        self.api_key = key or ""
+        self.client = OpenAI(api_key=self.api_key, base_url=BASE_URL,
+                             timeout=ASR_TIMEOUT_SECONDS, max_retries=0)
 
     def transcribe_file(self, filename, fileobj, mime):
         """

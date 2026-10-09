@@ -11,7 +11,10 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libs"))
 
 from openai import OpenAI
-from config import API_KEY, BASE_URL, LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_SYSTEM_PROMPT
+from config import (
+    API_KEY, BASE_URL, LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS,
+    LLM_SYSTEM_PROMPT, LLM_ENABLE_THINKING, LLM_TIMEOUT_SECONDS, LLM_MAX_RETRIES,
+)
 
 
 class LLM:
@@ -31,11 +34,35 @@ class LLM:
         :param api_key: 硅基流动 API Key，不填则用 config.py 默认值
         """
         self.api_key = api_key if api_key else API_KEY
-        # 同步 OpenAI 客户端
-        self.client = OpenAI(api_key=self.api_key, base_url=BASE_URL)
+        # 同步 OpenAI 客户端。
+        # 必须带超时：不设时 SDK 默认 600 秒，一次网络卡住就让语音链路无限等待
+        # （实测卡过 9 分钟毫无响应）。
+        self.client = OpenAI(api_key=self.api_key, base_url=BASE_URL,
+                             timeout=LLM_TIMEOUT_SECONDS, max_retries=LLM_MAX_RETRIES)
         self.model = LLM_MODEL
         # 对话历史（用于多轮对话，简单实现）
         self._history = []
+
+    def set_api_key(self, key):
+        """换 Key 时重建客户端"""
+        self.api_key = key or ""
+        self.client = OpenAI(api_key=self.api_key, base_url=BASE_URL,
+                             timeout=LLM_TIMEOUT_SECONDS, max_retries=LLM_MAX_RETRIES)
+
+    def _create(self, **kwargs):
+        """
+        统一出口，集中处理推理模型的"思考开关"。
+        实测 Qwen3.5 系列思考开启时首字延迟 37 秒、关闭后 0.79 秒（差 47 倍）。
+        若模型不支持该参数，自动去掉它重试一次。
+        """
+        extra = {"enable_thinking": bool(LLM_ENABLE_THINKING)}
+        try:
+            return self.client.chat.completions.create(extra_body=extra, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            if any(k in msg for k in ("enable_thinking", "chat_template", "extra_body")):
+                return self.client.chat.completions.create(**kwargs)
+            raise
 
     def _build_messages(self, user_text):
         """
@@ -58,7 +85,7 @@ class LLM:
         try:
             messages = self._build_messages(user_text)
 
-            response = self.client.chat.completions.create(
+            response = self._create(
                 model=self.model,
                 messages=messages,
                 temperature=LLM_TEMPERATURE,
@@ -108,7 +135,7 @@ class LLM:
             full_reply = ""
 
             # 开启流式模式
-            stream = self.client.chat.completions.create(
+            stream = self._create(
                 model=self.model,
                 messages=messages,
                 temperature=LLM_TEMPERATURE,
