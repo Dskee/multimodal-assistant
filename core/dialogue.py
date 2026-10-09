@@ -499,7 +499,11 @@ class DialogueEngine:
 
     # -------------------- 生命周期 --------------------
 
-    def start(self):
+    def start(self, open_listener=True):
+        """
+        :param open_listener: 是否同时打开麦克风与回环。
+                              False = 只用文字通道（没有麦克风、或用户只想打字时）
+        """
         if self._worker and self._worker.is_alive():
             return True, ""
         self._stop.clear()
@@ -508,7 +512,7 @@ class DialogueEngine:
         # 后台预合成即时应答音（不拖慢启动）
         if TTS_FILLER_ENABLED:
             threading.Thread(target=self._prefetch_fillers, daemon=True).start()
-        if self.listener is not None:
+        if self.listener is not None and open_listener:
             ok, err = self.listener.start()
             if not ok:
                 return False, err
