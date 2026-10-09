@@ -1,11 +1,31 @@
+# 智能语音助手（无障碍版）依赖
+#
+# 环境：Windows + Python 3.9（venv 由 --system-site-packages 创建，继承 Anaconda base）
+#
+# ⚠️ numpy 必须 < 2：mediapipe 1.1.0 依赖 numpy<2，
+#    装它会自动把 numpy 降到 1.24.x。此时若使用 opencv-python 5.x（要求 numpy>=2）
+#    会冲突；实测可行的组合是 numpy 1.24.4 + opencv-contrib-python 4.11（由 mediapipe 带装）。
+#    改依赖前先确认这个组合没被破坏。
+
+# ---- 界面 ----
 PyQt5==5.15.11
-PyQt5-Qt5==5.15.2
-PyQt5-sip==12.17.0
-openai>=1.0.0
-opencv-python>=4.8.0
-pyaudio>=0.2.14
-pydub>=0.25.1
-edge-tts>=6.1.9
-aiohttp>=3.9.0
-pygame>=2.5.0
-numpy>=1.24.0
+
+# ---- 音频采集与处理 ----
+pyaudio>=0.2.14            # 麦克风采集
+pyaudiowpatch>=0.2.12.9    # WASAPI 回环采集（回声消除的参考信号）；cp39 有预编译轮子
+webrtcvad-wheels>=2.0.14   # VAD 自动断句；cp39 有预编译轮子
+
+# ---- 识别 / 对话 / 播报 ----
+openai>=1.0.0              # 硅基流动 OpenAI 兼容接口（ASR 与 LLM）
+edge-tts>=6.1.9            # 本地语音合成（免费、离线）
+pygame>=2.5.0              # 音频播放
+aiohttp>=3.9.0             # edge-tts 异步依赖
+pydub>=0.25.1              # 音频格式处理（备用）
+
+# ---- 视觉与手势 ----
+mediapipe>=1.1.0           # 手部 21 关键点（Tasks API；模型文件 models/hand_landmarker.task）
+opencv-contrib-python>=4.11  # 摄像头取帧、图像编解码
+openwakeword>=0.6.0        # 离线唤醒词（当前默认关闭，见 config.WAKE_WORD_ENABLED）
+
+# ---- 数值 ----
+numpy>=1.24,<2             # 见文件顶部说明：与 mediapipe 的约束绑定
