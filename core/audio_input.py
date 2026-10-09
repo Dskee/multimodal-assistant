@@ -38,6 +38,7 @@ from config import (
     RECORD_RATE,
     VAD_MODE, VAD_FRAME_MS, SILENCE_END_MS, MIN_SPEECH_MS,
     MAX_UTTERANCE_SECONDS, VAD_PADDING_MS,
+    VAD_GATE_ENABLED, VAD_GATE_RATIO, VAD_GATE_MIN_RMS,
     AEC_FILTER_MS, AEC_STEP_SIZE,
     BARGE_IN_ENERGY_RATIO, BARGE_IN_MIN_MS, BARGE_IN_GRACE_MS,
 )
@@ -110,23 +111,51 @@ class VadSegmenter:
         self._speech_frames = 0        # 本句里判定为语音的帧数
         self._prefix = deque(maxlen=self.padding_frames)   # 语音起点前的 padding
         self._in_speech = False
-        # 能量后端的自适应噪声底
-        self._noise_floor = 0.01
+        # 长期本底（自适应噪声门用；门默认关闭，见 config.VAD_GATE_ENABLED 的说明）
+        self.noise_floor = None
         self.last_dropped_short = 0
 
     # ---------- 单帧判定 ----------
 
+    def is_speech(self, frame):
+        """
+        公开的单帧判定，供打断检测复用（判断残差"像不像人声"）。
+        纯能量判据会把键盘声、椅子声也当成语音，加上这一道能显著减少误判。
+        """
+        return bool(self._is_speech(frame))
+
     def _is_speech(self, frame):
-        if self._vad is not None:
-            try:
-                return self._vad.is_speech(frame, self.sample_rate)
-            except Exception:
-                pass
-        # 能量后端：超过噪声底若干倍算语音
+        """
+        单帧判定 = webrtcvad 的语音判定 **且** 能量高于自适应噪声门。
+
+        为什么要加能量门：实测本机麦克风本底 RMS 0.0176（-35dBFS 量级），
+        webrtcvad 在这么高的本底下会把环境噪声持续判成说话，
+        导致（a）切出 6 秒的假句子（b）播报中误触发打断。
+        """
         level = rms(pcm_to_float(frame))
+
+        # 长期本底：只在"当前没在说话"时更新，避免说话把本底抬上去。
+        # 低于本底时快速跟随（0.9/0.1），高于本底时极慢上升（0.995/0.005）。
         if not self._in_speech:
-            self._noise_floor = 0.95 * self._noise_floor + 0.05 * level
-        return level > max(self._noise_floor * 3.0, 0.01)
+            if self.noise_floor is None:
+                self.noise_floor = level
+            elif level < self.noise_floor:
+                self.noise_floor = 0.9 * self.noise_floor + 0.1 * level
+            else:
+                self.noise_floor = 0.995 * self.noise_floor + 0.005 * level
+
+        gate = VAD_GATE_MIN_RMS
+        if self.noise_floor is not None:
+            gate = max(gate, self.noise_floor * VAD_GATE_RATIO)
+
+        if self._vad is not None:
+            if not VAD_GATE_ENABLED or level >= gate:
+                try:
+                    return self._vad.is_speech(frame, self.sample_rate)
+                except Exception:
+                    pass
+            return False
+        return level > gate
 
     # ---------- 主入口 ----------
 
@@ -407,10 +436,13 @@ class BargeInDetector:
         self.triggered_at = None
         self.last_ratio = 0.0
 
-    def update(self, residual, playing=True):
+    def update(self, residual, playing=True, is_speech=None):
         """
         :param residual: 回声消除后的残差（float32）
         :param playing: 当前是否在播报
+        :param is_speech: 这一帧是否"像人声"（webrtcvad 判定）。传 False 时
+                          即使能量高也不累加——用来挡掉键盘声、椅子声这类噪声。
+                          传 None 表示不做语音门控。
         :return: (是否判定打断, 当前能量/本底比值)
         """
         block_ms = (len(residual) / float(self.sample_rate) * 1000.0) if len(residual) else 0.0
@@ -445,7 +477,9 @@ class BargeInDetector:
         # 带泄漏的累加器：超阈值就累加，低于阈值就扣减而不是清零。
         # 真实语音是音节性的（能量天然起伏），"必须连续超阈值"会被一次低谷清零，
         # 导致该触发时反而永远触发不了（踩过这个坑）。
-        if ratio >= self.energy_ratio:
+        # 再加一道语音门控：能量够 + 像人声 才累加。
+        voiced = (is_speech is None) or bool(is_speech)
+        if ratio >= self.energy_ratio and voiced:
             self._run_ms += block_ms
         else:
             self._run_ms = max(0.0, self._run_ms - block_ms)

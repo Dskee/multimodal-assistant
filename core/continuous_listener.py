@@ -160,6 +160,8 @@ class ContinuousListener:
         self._calibrating = False
         self._calib_need = 0
         self._calib_pending = False
+        self._calib_failures = 0
+        self._no_echo_path = False        # 连续两次测不到回声路径则置真（例如戴耳机）
         self.mic_channels = 1                # 打开成功后被 _open_mic 覆盖
         self.mic_device_used = None
         self.loopback_info = None
@@ -252,7 +254,7 @@ class ContinuousListener:
             self._ref_delay_line = np.zeros(0, dtype=np.float32)
             if self.barge_in:
                 self.barge_in.reset()
-            if self.aec is not None and not self.aec.calibrated:
+            if self.aec is not None and not self.aec.calibrated and not self._no_echo_path:
                 # 只是"排队等标定"：等回环真的送来声音再开始，
                 # 否则会拿一堆静音去估时延，得到相关系数≈0 的垃圾参数
                 self._calib_pending = True
@@ -305,13 +307,24 @@ class ContinuousListener:
         回调模式下没有 Python 线程阻塞在 read() 上，关闭就是安全的；
         而且回调不来数据恰好等价于"当前没在播报"，语义正确。
         """
+        import pyaudiowpatch as pyaudio_wp   # 需要模块级常量 paContinue/paComplete
+        # 关键：必须选"与默认输出设备配对"的那条回环。
+        # 本机默认输出是耳机(KT10S)，而回环列表里第一个是扬声器(Realtek)，
+        # 取第一个会导致：声音从耳机出来、却去录扬声器端点 → 永远静音、
+        # 回调一次都不触发、AEC 无从标定（实测踩到）。
+        info = None
         if self.loopback_device is not None:
             info = pa_wp.get_device_info_by_index(int(self.loopback_device))
         else:
-            devs = list_loopback_devices()
-            if not devs or "error" in devs[0]:
-                raise Exception("未找到回环设备")
-            info = pa_wp.get_device_info_by_index(int(devs[0]["index"]))
+            try:
+                info = pa_wp.get_default_wasapi_loopback()
+            except Exception:
+                info = None
+            if info is None:
+                devs = list_loopback_devices()
+                if not devs or "error" in devs[0]:
+                    raise Exception("未找到回环设备")
+                info = pa_wp.get_device_info_by_index(int(devs[0]["index"]))
 
         in_rate = int(info.get("defaultSampleRate", 48000))
         channels = int(info.get("maxInputChannels", 2)) or 2
@@ -323,20 +336,25 @@ class ContinuousListener:
         frames = max(64, int(round(self.block_samples * ratio)))
 
         def _callback(in_data, frame_count, time_info, status):
-            if self._ref_abort or self._stop.is_set():
-                return None, pa_wp.paComplete
+            # 音频线程里绝不能抛异常出去（会直接杀掉进程），整体兜住
             try:
+                if self._ref_abort or self._stop.is_set():
+                    return None, pyaudio_wp.paComplete
+                if not in_data:
+                    return None, pyaudio_wp.paContinue
                 y = self._resampler.process(in_data)
-            except Exception:
-                return None, pa_wp.paContinue
-            if y is not None and len(y):
-                with self._ref_lock:
-                    self._ref_queue = np.concatenate([self._ref_queue, y])
-                    cap = self.sample_rate // 2          # 积压上限 0.5 秒
-                    if len(self._ref_queue) > cap:
-                        self._ref_queue = self._ref_queue[-cap:]
-                    self.stats["ref_blocks"] = self.stats.get("ref_blocks", 0) + 1
-            return None, pa_wp.paContinue
+                if y is not None and len(y):
+                    with self._ref_lock:
+                        self._ref_queue = np.concatenate([self._ref_queue, y])
+                        cap = self.sample_rate // 2          # 积压上限 0.5 秒
+                        if len(self._ref_queue) > cap:
+                            self._ref_queue = self._ref_queue[-cap:]
+                        self.stats["ref_blocks"] = self.stats.get("ref_blocks", 0) + 1
+            except Exception as e:
+                self._ref_error = str(e)[:80]
+            # paContinue/paComplete 是 pyaudiowpatch 的**模块级常量**，
+            # 从 PyAudio 实例上取会 AttributeError（踩过）
+            return None, pyaudio_wp.paContinue
 
         stream = pa_wp.open(format=8,   # paInt16
                             channels=channels, rate=in_rate, input=True,
@@ -394,11 +412,22 @@ class ContinuousListener:
         self._calib_ref = []
         self._calibrating = False
         delay, gain, corr = self.aec.calibrate(mic_cat, ref_cat)
-        # 相关度太低说明这段里有人说话或根本没在播报，别用这组参数
+        # 相关度太低说明这段里有人说话、或根本没有回声路径（例如声音从耳机出来、
+        # 麦克风是笔记本内置麦，耳机的声音传不回去）。
         if corr < 0.4:
             self.aec.calibrated = False
-            self._emit_status("回声路径标定不可靠（相关度 %.2f），下次播报再试" % corr)
+            self._calib_failures += 1
+            if self._calib_failures >= 2:
+                # 两次都测不到回声路径：判定为"无回声"，不再反复重试。
+                # 此时打断检测退化为"语音门控 + 能量"，没有回声干扰反而更干净。
+                self._no_echo_path = True
+                self._emit_status("未检测到回声路径（可能戴着耳机）：不做回声消除，"
+                                  "打断检测改用语音门控。")
+            else:
+                self._emit_status("回声路径标定不可靠（相关度 %.2f），下次播报再试" % corr)
         else:
+            self._calib_failures = 0
+            self._no_echo_path = False
             self._emit_status("回声路径已标定：时延 %.0fms，增益 %.2f，相关度 %.2f"
                               % (delay / self.sample_rate * 1000, gain, corr))
 
@@ -466,7 +495,11 @@ class ContinuousListener:
                 # 7) 播报中：判定打断；否则：VAD 切句
                 if self._playing:
                     if self.barge_in is not None and not self._calibrating:
-                        fired, ratio = self.barge_in.update(residual, playing=True)
+                        # 语音门控：只有"能量够 + 像人声"才认为用户在插话，
+                        # 挡掉键盘声/椅子声这类噪声造成的误打断
+                        speech_like = self.segmenter.is_speech(float_to_pcm(residual))
+                        fired, ratio = self.barge_in.update(residual, playing=True,
+                                                            is_speech=speech_like)
                         if fired:
                             self.stats["barge_ins"] += 1
                             if self.on_barge_in:
