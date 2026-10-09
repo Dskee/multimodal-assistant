@@ -35,6 +35,8 @@ from config import (
     DEFAULT_SPEECH_RATE, TTS_TIMEOUT_SECONDS, TTS_MAX_TEXT_CHARS,
     TTS_STREAM_BY_SENTENCE, TTS_SENTENCE_MIN_CHARS, TTS_SOFT_CUT_MIN_CHARS,
     TTS_FILLER_ENABLED, TTS_FILLERS,
+    CONFIRM_ENABLED, CONFIRM_KEYWORDS, CONFIRM_YES, CONFIRM_NO,
+    CONFIRM_TIMEOUT_SECONDS, CONFIRM_MAX_ANSWER_CHARS,
 )
 
 # 状态常量（界面据此显示"聆听中/识别中/思考中/播报中"）
@@ -436,7 +438,11 @@ class DialogueEngine:
 
         # 统计
         self.stats = {"asr_ms": 0.0, "llm_first_ms": 0.0, "first_audio_ms": 0.0,
-                      "filler_ms": 0.0, "turns": 0, "barge_ins": 0}
+                      "filler_ms": 0.0, "turns": 0, "barge_ins": 0, "confirmations": 0}
+
+        # 确认式交互：等待用户对"关键信息复述"的答复
+        self._pending_confirm = None
+        self._pending_since = 0.0
 
         # 即时应答音（启动时后台预合成，播放延迟只有几十毫秒）
         self._fillers = []          # [(path, seconds), ...]
@@ -567,6 +573,55 @@ class DialogueEngine:
             self.listener.set_playing(playing)
         self._set_state(STATE_SPEAKING if playing else STATE_LISTENING)
 
+    # -------------------- 确认式交互 --------------------
+
+    def _needs_confirm(self, text):
+        """识别结果里是否含关键信息（用药/金额/时间…），需要先复述确认"""
+        if not CONFIRM_ENABLED:
+            return None
+        t = text or ""
+        for kw in CONFIRM_KEYWORDS:
+            if kw in t:
+                return kw
+        return None
+
+    @staticmethod
+    def _classify_answer(text):
+        """
+        判断用户对复述的答复：yes / no / other
+
+        两条规则都是踩过坑才定下来的：
+          1. **先完全匹配**：'没错' 必须在这里判为肯定。如果一上来做包含判断，
+             它会被否定词里的 '错' 命中，把肯定听成否定（用药场景会直接误操作）。
+          2. 再做包含判断时，**否定词优先**：'不对' 里含 '对'，顺序反了同样会判错。
+        """
+        t = "".join(ch for ch in (text or "") if ch not in "，。！？、,.!? \t")
+        if not t or len(t) > CONFIRM_MAX_ANSWER_CHARS:
+            return "other"
+        for w in CONFIRM_YES:
+            if t == w:
+                return "yes"
+        for w in CONFIRM_NO:
+            if t == w:
+                return "no"
+        for w in CONFIRM_NO:
+            if w in t:
+                return "no"
+        for w in CONFIRM_YES:
+            if w in t:
+                return "yes"
+        return "other"
+
+    def _speak_once(self, text):
+        """单独播一句话（确认提示等），复用分句播报链路，因此也会正确地进入/退出播报态"""
+        try:
+            self.player.begin()
+            self.player.push(text)
+            self.player.end()
+            self.player.wait(timeout=30)
+        except Exception as e:
+            self._emit(self.on_error, "播报失败: %s" % str(e)[:80])
+
     # -------------------- 工作线程 --------------------
 
     def _worker_loop(self):
@@ -584,8 +639,37 @@ class DialogueEngine:
                 if not text:
                     self._set_state(STATE_LISTENING)
                     continue
+
+                # ---- 先处理"上一轮关键信息的答复" ----
+                if self._pending_confirm:
+                    answer = self._classify_answer(text)
+                    pending = self._pending_confirm
+                    expired = (time.time() - self._pending_since) > CONFIRM_TIMEOUT_SECONDS
+                    self._pending_confirm = None
+                    if not expired and answer == "yes":
+                        text = pending          # 用确认过的原文继续，避免拿错字去回答
+                        self._emit(self.on_status, "已确认，按识别结果继续")
+                    elif not expired and answer == "no":
+                        self._emit(self.on_status, "用户否定了识别结果")
+                        self._emit(self.on_subtitle, ("系统", "好，请您再说一次"))
+                        self._speak_once("好的，请您再说一次。")
+                        continue
+                    # 超时或答非所问：当作新的一句话正常往下走
+
                 self._emit(self.on_user_text, text)
                 self._emit(self.on_subtitle, ("用户", text))
+
+                # ---- 关键信息先复述确认（只对语音输入做；打字输入是用户自己敲的，不必问）----
+                if kind == "audio" and self._needs_confirm(text):
+                    self._pending_confirm = text
+                    self._pending_since = time.time()
+                    prompt = "您是说：%s，对吗？" % text
+                    self._emit(self.on_status, "关键信息，先复述确认")
+                    self._emit(self.on_subtitle, ("系统", prompt))
+                    self.stats["confirmations"] += 1
+                    self._speak_once(prompt)
+                    continue
+
                 # 语音输入才播"即时应答音"：打字输入的用户不需要被安抚
                 if kind == "audio":
                     t_fill = time.time()

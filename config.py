@@ -215,31 +215,68 @@ SUBTITLE_MAX_ITEMS = 200      # 字幕历史保留条数
 SUBTITLE_ALWAYS_ON_TOP = True # 字幕窗口置顶，方便对方看着读
 
 # ============ 确认式交互（关键信息必须复述） ============
-# 实测 ASR 会把"这个药"听成"这个要"，用药/金额/时间这类信息必须二次确认
+# 实测 ASR 会把"这个药"听成"这个要"，用药/金额/时间这类信息必须二次确认。
+# 做法：识别结果命中关键词时，先复述一遍问"对吗"，得到肯定答复才真正回答。
 CONFIRM_ENABLED = True
 CONFIRM_KEYWORDS = ("药", "吃几", "剂量", "钱", "多少钱", "金额", "转账",
                     "几点", "时间", "日期", "预约", "密码")
+# 肯定/否定答复的判定词（用户回答通常很短："对"、"是的"、"不对"）
+# 注意：否定词里**不能**出现裸"错"字——"没错"是肯定，含"错"就会被误判成否定
+#（这个坑在自检里被抓到过）。否定用"错的/错了"这类完整词。
+CONFIRM_YES = ("没错", "对", "对的", "是", "是的", "嗯", "好", "正确", "可以", "没问题")
+CONFIRM_NO = ("不对", "不是", "错的", "错了", "重说", "再说一遍", "否", "别", "不用")
+CONFIRM_TIMEOUT_SECONDS = 20      # 超过这么久没答复，就当这次确认作废
+CONFIRM_MAX_ANSWER_CHARS = 8      # 答复超过这么多字，说明用户在说新事情，不再当作确认
 
 # ============ 手语 / 手势（视觉通道） ============
 # 完整手语是"手形+位置+运动+表情"的语法系统，全量识别属研究级难题。
-# 本项目定位受限词表：高频沟通手语 + 数字手势 + 控制手势。
+# 本项目定位受限词表：静态手势（可解释的几何规则）+ 数字手势 + 控制手势。
 HAND_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "hand_landmarker.task")
+HAND_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+                  "hand_landmarker/float16/1/hand_landmarker.task")
 HAND_MAX_HANDS = 2
 HAND_DETECT_CONFIDENCE = 0.5
 GESTURE_SAMPLE_INTERVAL_MS = 100    # 采样间隔，太密费 CPU、太疏漏动作
+GESTURE_HOLD_MS = 600               # 同一手势需保持这么久才触发（防抖动误触发）
+GESTURE_COOLDOWN_MS = 1500          # 触发后多久内不再重复触发同一手势
+GESTURE_MIN_CONFIDENCE = 0.6        # 分类置信度下限
 
-# 内置常用手语词（对应聋哑用户的高频表达需求）
-COMMON_SIGNS = ("喝水", "吃饭", "上厕所", "疼", "吃药", "帮忙",
-                "谢谢", "不要", "等一下", "医院", "回家", "打电话")
+# 手势用途模式：
+#   "control" —— 手势用来操作程序（✋开始/停止聆听、✊取消、👍确认、👎停止播报、✌️切字幕、挥手急停）
+#   "speak"   —— 手势当作"说话"（识别成短语后用语音播报给对方听），面向聋哑用户
+GESTURE_MODE = "control"
 
-# 控制手势 -> 动作（免手操作程序本身）
+# 静态手势 -> 要说出的话（"speak" 模式下生效，也是聋哑用户表达需求的词表）
+# 说明：这是**本项目定义的简化手势词表**，不等同于中国手语的标准打法；
+#       标准手语需要带时序标注的数据集与训练模型。
+GESTURE_PHRASES = {
+    "open_palm": "等一下",
+    "fist": "不要",
+    "thumbs_up": "好的，谢谢",
+    "thumbs_down": "我不舒服",
+    "point": "我要这个",
+    "one": "一", "two": "二", "three": "三", "four": "四",
+    "five": "五", "six": "六", "eight": "八",
+}
+
+# 控制手势 -> 动作名（"control" 模式）
 GESTURE_CONTROLS = {
-    "open_palm": "开始/停止聆听",
-    "fist": "取消当前输入",
-    "thumbs_up": "确认发送",
-    "thumbs_down": "停止播报",
-    "victory": "切换字幕模式并放大字号",
-    "wave": "紧急停止（断麦断摄像头）",
+    "open_palm": "toggle_listening",
+    "fist": "cancel",
+    "thumbs_up": "confirm",
+    "thumbs_down": "stop_speaking",
+    "victory": "toggle_subtitle",
+    "wave": "emergency_stop",
+}
+
+# 控制手势的中文说明（界面展示用）
+GESTURE_CONTROL_LABELS = {
+    "toggle_listening": "开始/停止聆听",
+    "cancel": "取消当前输入",
+    "confirm": "确认发送",
+    "stop_speaking": "停止播报",
+    "toggle_subtitle": "切换字幕模式",
+    "emergency_stop": "紧急停止（断麦）",
 }
 
 # ============ 隐私开关 ============
