@@ -225,12 +225,18 @@ class SpeechPlayer:
             self._thread.start()
 
     def push(self, sentence):
-        """塞一句待播报文本"""
+        """塞一句待播报文本（会先清掉 markdown，防止"星号星号"被念出来）"""
         sentence = (sentence or "").strip()
         if not sentence or self._interrupted.is_set():
             return
-        too_long = len(sentence) > self.max_chars
-        if too_long:
+        try:
+            from core.text_utils import strip_markdown
+            sentence = strip_markdown(sentence)
+        except Exception:
+            pass
+        if not sentence:
+            return
+        if len(sentence) > self.max_chars:
             sentence = sentence[:self.max_chars]
         with self._cv:
             self._q.append(sentence)
@@ -621,6 +627,19 @@ class DialogueEngine:
             self.player.wait(timeout=30)
         except Exception as e:
             self._emit(self.on_error, "播报失败: %s" % str(e)[:80])
+
+    def speak_text(self, text):
+        """
+        对外接口：直接把一句话读出来（手势短语、指物问答结果等）。
+        会自动确保引擎已启动（文字通道即可，不需要麦克风）。
+        """
+        if not self._worker or not self._worker.is_alive():
+            ok, err = self.start(open_listener=False)
+            if not ok:
+                self._emit(self.on_error, "无法启动播报：%s" % err)
+                return False
+        self._speak_once(text)
+        return True
 
     # -------------------- 工作线程 --------------------
 

@@ -40,6 +40,7 @@ from config import (
     API_KEY, LOCAL_VOICE_OPTIONS, DEFAULT_LOCAL_VOICE, DEFAULT_SPEECH_RATE,
     UI_FONT_SIZE, UI_SUBTITLE_FONT_SIZE, VAD_MODE, VAD_FRAME_MS, SILENCE_END_MS,
     MIN_SPEECH_MS, BARGE_IN_ENERGY_RATIO, BARGE_IN_MIN_MS, TTS_FILLERS,
+    GESTURE_MODE, OBJECT_QUESTION_TEXT, OBJECT_QUESTION_SPEAK,
 )
 
 
@@ -48,7 +49,7 @@ from config import (
 # ======================================================================
 
 class EngineBridge(QObject):
-    """把 DialogueEngine 的回调转成 Qt 信号（回调不在界面线程里）"""
+    """把 DialogueEngine / HandTracker 的回调转成 Qt 信号（回调不在界面线程里）"""
     sig_state = pyqtSignal(str)
     sig_user_text = pyqtSignal(str)
     sig_reply_chunk = pyqtSignal(str)
@@ -56,6 +57,7 @@ class EngineBridge(QObject):
     sig_subtitle = pyqtSignal(str, str)
     sig_status = pyqtSignal(str)
     sig_error = pyqtSignal(str)
+    sig_gesture = pyqtSignal(str, float)
 
 
 class VisionThread(QThread):
@@ -179,12 +181,14 @@ class MainWindow(QWidget):
         self.bridge.sig_subtitle.connect(self.on_subtitle)
         self.bridge.sig_status.connect(self.on_status)
         self.bridge.sig_error.connect(self.on_error)
+        self.bridge.sig_gesture.connect(self.on_gesture)
 
         self.analyzer = ImageAnalyzer()
         self.current_image = None
         self._display_buf = None
         self._threads = []
         self.subtitle_window = None
+        self.tracker = None          # 手势识别（HandTracker）
 
         self.font_size = UI_FONT_SIZE
         self.init_ui()
@@ -337,6 +341,45 @@ class MainWindow(QWidget):
         subv.addWidget(note_sub)
         right.addWidget(card_sub)
 
+        # ---- 手势识别 ----
+        card_gest = QFrame(self)
+        card_gest.setObjectName("card")
+        gv = QVBoxLayout(card_gest)
+        gv.setContentsMargins(18, 14, 18, 16)
+        gv.setSpacing(8)
+        lbl_gest = QLabel("手势识别（受限词表，非标准手语）", card_gest)
+        lbl_gest.setObjectName("cardTitle")
+        gv.addWidget(lbl_gest)
+
+        gh = QHBoxLayout()
+        gh.setSpacing(10)
+        self.btn_gesture = QPushButton("开启手势识别", card_gest)
+        self.btn_gesture.setMinimumHeight(46)
+        self.btn_gesture.clicked.connect(self.on_gesture_toggle)
+        gh.addWidget(self.btn_gesture, 1)
+
+        self.combo_gesture = QComboBox(card_gest)
+        self.combo_gesture.addItem("手势用于控制", "control")
+        self.combo_gesture.addItem("手势用于说话", "speak")
+        self.combo_gesture.setMinimumHeight(46)
+        self.combo_gesture.currentIndexChanged.connect(self.on_gesture_mode_changed)
+        gh.addWidget(self.combo_gesture, 1)
+        gv.addLayout(gh)
+
+        self.lbl_gesture = QLabel("最近手势：—", card_gest)
+        self.lbl_gesture.setObjectName("hint")
+        gv.addWidget(self.lbl_gesture)
+
+        note_gest = QLabel(
+            "控制模式：✋开始/停止聆听、✊取消、👍确认、👎停止播报、✌️切字幕、"
+            "挥手紧急停止、☝️指物提问。\n"
+            "说话模式：把手势读成短语说给对方听（面向聋哑用户，词表见说明）。",
+            card_gest)
+        note_gest.setObjectName("hint")
+        note_gest.setWordWrap(True)
+        gv.addWidget(note_gest)
+        right.addWidget(card_gest)
+
         # ---- 视觉（为手语/指物保留）----
         card_vision = QFrame(self)
         card_vision.setObjectName("card")
@@ -373,6 +416,10 @@ class MainWindow(QWidget):
         self.btn_analyze.clicked.connect(self.on_analyze)
         qh.addWidget(self.btn_analyze)
         vv.addLayout(qh)
+
+        self.check_speak_image = QCheckBox("识别结果语音报出（指物问答）", card_vision)
+        self.check_speak_image.setChecked(OBJECT_QUESTION_SPEAK)
+        vv.addWidget(self.check_speak_image)
         right.addWidget(card_vision, 1)
 
         # ---- 设置 ----
@@ -550,6 +597,119 @@ class MainWindow(QWidget):
         self.engine.submit_text(text)
         self.input_text.clear()
 
+    # -------------------- 手势识别 --------------------
+
+    def on_gesture_toggle(self):
+        if self.tracker is not None and self.tracker.is_running():
+            self.tracker.stop()
+            self.tracker = None
+            self.btn_gesture.setText("开启手势识别")
+            self.lbl_gesture.setText("最近手势：—")
+            self.on_status("手势识别已停止（摄像头已释放）")
+            return
+
+        from core.gesture import HandTracker
+        self.tracker = HandTracker(
+            on_gesture=self.bridge.sig_gesture.emit,
+            on_status=self.bridge.sig_status.emit,
+            on_error=self.bridge.sig_error.emit,
+            mode=self.combo_gesture.currentData() or GESTURE_MODE,
+        )
+        ok, err = self.tracker.start()
+        if not ok:
+            self.tracker = None
+            QMessageBox.warning(self, "手势识别无法启动", err)
+            return
+        self.btn_gesture.setText("停止手势识别")
+        self.on_status("手势识别已启动，模式：%s"
+                       % ("控制" if self.tracker.mode == "control" else "说话"))
+
+    def on_gesture_mode_changed(self, index):
+        if self.tracker is not None:
+            self.tracker.set_mode(self.combo_gesture.currentData())
+            self.on_status("手势模式切换为：%s"
+                           % ("控制程序" if self.tracker.mode == "control" else "说话（读出短语）"))
+
+    def on_gesture(self, name, confidence):
+        """手势事件（已在界面线程）"""
+        from core.gesture import HandTracker
+        label = name
+        self.lbl_gesture.setText("最近手势：%s（置信度 %.2f）" % (label, confidence))
+        self.chat.append("<i style='color:#7C3AED;'>[手势] %s</i>" % self._esc(label))
+
+        mode = self.tracker.mode if self.tracker is not None else GESTURE_MODE
+        if mode == "speak":
+            phrase = HandTracker.phrase_for(name)
+            if phrase:
+                self.chat.append("<b style='color:#0F766E;'>（手势说话）</b>%s" % self._esc(phrase))
+                self.on_subtitle("我", phrase)
+                self._speak(phrase)
+            else:
+                self.on_status("手势「%s」不在说话词表里" % label)
+            return
+
+        action = HandTracker.action_for(name)
+        if not action:
+            self.on_status("手势「%s」在控制模式里没有绑定动作" % label)
+            return
+        self.on_status("手势触发：%s" % HandTracker.action_label(action))
+        self._dispatch_gesture(action)
+
+    def _dispatch_gesture(self, action):
+        if action == "toggle_listening":
+            self.on_listen_toggle()
+        elif action == "cancel":
+            self.input_text.clear()
+            self.on_status("已取消当前输入")
+        elif action == "confirm":
+            if self.input_text.text().strip():
+                self.on_text_send()
+            else:
+                self.on_status("输入框是空的，没有可确认的内容")
+        elif action == "stop_speaking":
+            if self.engine is not None and self.engine.player is not None:
+                self.engine.player.interrupt()
+                self.on_status("已停止播报")
+        elif action == "toggle_subtitle":
+            self.on_toggle_subtitle()
+        elif action == "object_question":
+            self._object_question()
+        elif action == "emergency_stop":
+            self._emergency_stop()
+
+    def _emergency_stop(self):
+        """紧急停止：立刻断开麦克风与播报（隐私优先，动作要干脆）"""
+        try:
+            if self.engine is not None:
+                if self.engine.player is not None:
+                    self.engine.player.interrupt()
+                self.engine.stop()
+        except Exception:
+            pass
+        self.engine = None
+        self.btn_listen.setText("开始聆听")
+        self.lbl_state.setText("状态：已紧急停止")
+        self.on_status("已紧急停止：麦克风已断开")
+        self.on_subtitle("系统", "已紧急停止（麦克风断开）")
+
+    def _speak(self, text):
+        """直接读出一句话（手势短语、指物问答结果）"""
+        ok, err = self._ensure_engine(open_listener=False)
+        if not ok:
+            return
+        self.engine.speak_text(text)
+
+    def _object_question(self):
+        """指物提问：拍一张 → 问"这是什么" → 语音报出结果"""
+        image, err = self.analyzer.capture_from_camera()
+        if err:
+            QMessageBox.warning(self, "拍照失败", err)
+            return
+        self.current_image = image
+        self._show_image(image)
+        self.input_image_q.setText(OBJECT_QUESTION_TEXT)
+        self.on_analyze()
+
     # -------------------- 大字幕 --------------------
 
     def on_toggle_subtitle(self):
@@ -620,8 +780,11 @@ class MainWindow(QWidget):
         def on_done(reply, err):
             if err:
                 self.chat.append("<i style='color:#B91C1C;'>%s</i>" % self._esc(err))
-            else:
-                self.on_subtitle("我", reply)
+                return
+            self.on_subtitle("我", reply)
+            # 指物问答：把结果读出来（老年用户通常不想读屏幕上的字）
+            if reply and self.check_speak_image.isChecked():
+                self._speak(reply)
 
         th = VisionThread(self.analyzer, self.current_image.copy(), question)
         th.token.connect(on_token)
@@ -705,6 +868,11 @@ class MainWindow(QWidget):
     # -------------------- 退出 --------------------
 
     def closeEvent(self, event):
+        try:
+            if self.tracker is not None:
+                self.tracker.stop()      # 释放摄像头
+        except Exception:
+            pass
         try:
             if self.engine is not None:
                 self.engine.stop()

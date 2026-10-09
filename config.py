@@ -267,6 +267,7 @@ GESTURE_CONTROLS = {
     "thumbs_down": "stop_speaking",
     "victory": "toggle_subtitle",
     "wave": "emergency_stop",
+    "point": "object_question",      # 食指指 → 拍下并问"这是什么"，结果语音报出
 }
 
 # 控制手势的中文说明（界面展示用）
@@ -277,7 +278,12 @@ GESTURE_CONTROL_LABELS = {
     "stop_speaking": "停止播报",
     "toggle_subtitle": "切换字幕模式",
     "emergency_stop": "紧急停止（断麦）",
+    "object_question": "指物提问（拍照并读出结果）",
 }
+
+# 指物问答：VL 模型的默认问题与是否语音报出结果
+OBJECT_QUESTION_TEXT = "这是什么？用一两句口语说清楚，不要用列表。"
+OBJECT_QUESTION_SPEAK = True
 
 # ============ 隐私开关 ============
 # 摄像头与麦克风各有独立开关；一键"紧急停止"会同时断开
