@@ -18,7 +18,6 @@
 读剪贴板用 PowerShell 的 Get-Clipboard；截屏用 Pillow（Anaconda 自带）。
 """
 
-import json
 import os
 import re
 import subprocess
@@ -26,7 +25,7 @@ import time
 
 from config import (
     PROJECT_ROOT, COMMANDS_ENABLED, COMMAND_APP_WHITELIST, COMMAND_SITE_WHITELIST,
-    COMMAND_VOLUME_KEY_PRESSES, NOTES_PATH,
+    COMMAND_VOLUME_KEY_PRESSES,
 )
 
 # 音量键：Windows 的虚拟键码
@@ -71,10 +70,13 @@ class LocalCommands:
             交给大模型
     """
 
-    def __init__(self, analyzer=None, api_key=None, notes_path=NOTES_PATH, dry_run=False):
+    def __init__(self, analyzer=None, api_key=None, memory=None, dry_run=False):
         self.analyzer = analyzer
         self.api_key = api_key
-        self.notes_path = notes_path
+        if memory is None:
+            from core.memory import MemoryStore
+            memory = MemoryStore()
+        self.memory = memory
         self.dry_run = dry_run          # 自检用：只判断"会执行什么"，不真的执行
         self.last_plan = ""             # 自检用：记录将要执行的动作
         self.enabled = bool(COMMANDS_ENABLED)
@@ -92,9 +94,12 @@ class LocalCommands:
             return CommandResult()
         plain = self._plain(t)
 
+        # 顺序有讲究：_h_memory_query 必须在 _h_read_notes 之前。
+        # 「今天记了什么」「记了多少条」这类问句也含"记了"二字，
+        # 若先跑"读记事"就会被它抢走，答成记事列表而不是按日期或统计的结果（自检抓到）。
         for handler in (self._h_help, self._h_time, self._h_volume, self._h_open,
-                        self._h_note, self._h_read_notes, self._h_clipboard,
-                        self._h_screen_text):
+                        self._h_remember_fact, self._h_note, self._h_memory_query,
+                        self._h_read_notes, self._h_clipboard, self._h_screen_text):
             res = handler(t, plain)
             if res is not None and res.handled:
                 return res
@@ -111,9 +116,11 @@ class LocalCommands:
         if any(k in p for k in ("你能做什么", "你会什么", "有什么功能", "帮助", "怎么用", "能干啥")):
             apps = "、".join(COMMAND_APP_WHITELIST.keys())
             return CommandResult(True,
-                                 "我可以陪您说话，也能帮您做一些操作。"
+                                 "我可以陪您说话，也帮您记事、查事。"
                                  "您可以说：声音大一点、小一点、静音；"
-                                 "打开%s；几点了；记一下…；读一下待办；"
+                                 "打开%s；几点了；"
+                                 "记一下 今天血压多少；记住 我女儿叫小芳；"
+                                 "读一下记事；今天记了什么；查一下 血压；"
                                  "读一下剪贴板；读一下屏幕上的字。" % apps,
                                  "help")
         return None
@@ -195,8 +202,25 @@ class LocalCommands:
                              "我只能打开这几个：%s。您说的是「%s」，我不认识，"
                              "为安全起见没有打开。" % (apps, name[:12]), "open_rejected")
 
+    def _h_remember_fact(self, t, p):
+        """
+        「记住 X」→ 关于用户的**长期事实**（与「记一下」的日志区分开）。
+        区分很重要：事实每次对话都会注入大模型，日志只在相关时才检索出来——
+        把"我女儿叫小芳"当日志存，问起时不一定想得起来。
+        """
+        m = re.match(r"^(?:你要记住|帮我记住|记住)(.*)$", t.strip())
+        if not m:
+            return None
+        content = m.group(1).lstrip("：: ，,、").strip()
+        if not content:
+            return CommandResult(True, "要记住什么？说「记住」后面跟上内容就行。", "fact_empty")
+        self.last_plan = "fact:%s" % content[:30]
+        if not self.dry_run:
+            self.memory.add_fact(content)
+        return CommandResult(True, "记住了：%s。以后问起我会记得。" % content, "fact")
+
     def _h_note(self, t, p):
-        m = re.match(r"^(?:记一下|记一笔|帮我记|记住|记录)(.*)$", t.strip())
+        m = re.match(r"^(?:记一下|记一笔|帮我记|记录|写一下|记日志|日志)(.*)$", t.strip())
         if not m:
             return None
         content = m.group(1).lstrip("：: ，,、").strip()
@@ -205,44 +229,79 @@ class LocalCommands:
         self.last_plan = "note:%s" % content[:30]
         if self.dry_run:
             return CommandResult(True, "（自检）已记录：%s" % content, "note")
-        item = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "text": content}
-        try:
-            os.makedirs(os.path.dirname(self.notes_path), exist_ok=True)
-            items = []
-            if os.path.exists(self.notes_path):
-                with open(self.notes_path, "r", encoding="utf-8") as f:
-                    items = json.load(f)
-            items.append(item)
-            with open(self.notes_path, "w", encoding="utf-8") as f:
-                json.dump(items, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            return CommandResult(True, "记不下来，写文件出错了。", "note_failed")
-        return CommandResult(True, "记好了：%s" % content, "note")
+        self.memory.add(content)
+        return CommandResult(True, "记好了：%s。想回看就说「读一下记事」。" % content, "note")
 
     def _h_read_notes(self, t, p):
-        if not any(k in p for k in ("待办", "记事", "记了", "记住了", "笔记", "我记的")):
+        # 只认"读记事"这类明确说法；不能用"记了"这种宽泛词，
+        # 否则会把「今天记了什么」「记了多少条」抢过来（见 try_handle 里的顺序说明）
+        if not any(k in p for k in ("记事", "待办", "我的笔记", "最近记的")):
             return None
         if any(k in p for k in ("清空", "删掉", "删除", "都删")):
             if not self.dry_run:
-                try:
-                    if os.path.exists(self.notes_path):
-                        os.remove(self.notes_path)
-                except Exception:
-                    pass
-            return CommandResult(True, "好，记事已经清空了。", "notes_clear")
-        items = []
-        try:
-            if os.path.exists(self.notes_path):
-                with open(self.notes_path, "r", encoding="utf-8") as f:
-                    items = json.load(f)
-        except Exception:
-            items = []
+                self.memory.clear("log")
+            return CommandResult(True, "好，日志和待办已经清空了（关于您的事实还留着）。",
+                                 "notes_clear")
+        items = self.memory.recent(5)
         if not items:
             return CommandResult(True, "您还没记过什么。说「记一下」后面跟上内容就行。",
                                  "notes_empty")
-        recent = items[-5:]
-        lines = "；".join("%s" % it.get("text", "") for it in recent)
-        return CommandResult(True, "您最近记了%d条：%s" % (len(items), lines), "notes_read")
+        lines = "；".join("%s（%s）" % (e["text"][:40], e["ts"][5:16]) for e in items)
+        return CommandResult(True, "您最近记了%d条：%s" % (self.memory.count("log"), lines),
+                             "notes_read")
+
+    def _h_memory_query(self, t, p):
+        """回看记忆：按日期、按关键词、看统计、清空"""
+        # 1) 清空全部记忆
+        if any(k in p for k in ("清空记忆", "忘掉我说过的", "删除所有记忆", "清空所有记忆")):
+            n = 0 if self.dry_run else self.memory.clear()
+            return CommandResult(True, "好，记忆都清空了。", "memory_clear")
+
+        # 2) 统计
+        if any(k in p for k in ("记了多少", "多少条", "记忆统计", "统计一下")):
+            s = self.memory.stats()
+            return CommandResult(True,
+                                 "您一共记了%d条：日志%d条、关于您的事实%d条、对话记录%d条。"
+                                 % (s["total"], s["log"], s["fact"], s["chat"]),
+                                 "memory_stats")
+
+        # 3) 按日期回看（"今天聊了什么" / "昨天记了什么" / "这周记了什么"）
+        day = None
+        if any(k in p for k in ("今天", "今日")):
+            day = "today"
+        elif any(k in p for k in ("昨天", "昨日")):
+            day = "yesterday"
+        elif any(k in p for k in ("这周", "上周", "最近一周", "七天", "这几天")):
+            day = "week"
+        if day and any(k in p for k in ("聊", "说", "记录", "记", "日志", "待办")):
+            kind = "chat" if any(k in p for k in ("聊", "说")) else None
+            items = self.memory.by_date(day, kind=kind)
+            label = {"today": "今天", "yesterday": "昨天", "week": "最近一周"}[day]
+            if not items:
+                return CommandResult(True, "%s还没有记录。" % label, "memory_day_empty")
+            lines = []
+            for e in items[-6:]:
+                line = e["text"][:40]
+                if e.get("reply"):
+                    line += "（当时回答：%s）" % e["reply"][:20]
+                lines.append(line)
+            return CommandResult(True, "%s一共%d条：%s" % (label, len(items), "；".join(lines)[:240]),
+                                 "memory_day")
+
+        # 4) 关键词检索（"查一下 血压" / "还记得 医院"）
+        m = re.match(r"^(?:查一下|查查|找一下|搜索|我什么时候记过|还记得|记得)(.*)$", t.strip())
+        if m:
+            kw = m.group(1).lstrip("：: ，,、").strip()
+            if not kw:
+                return CommandResult(True, "要查什么？说「查一下」后面跟上关键词。",
+                                     "memory_search_empty")
+            hits = self.memory.search(kw, limit=3)
+            if not hits:
+                return CommandResult(True, "没找到关于「%s」的记录。" % kw[:12], "memory_search_none")
+            lines = "；".join("%s（%s）" % (e["text"][:40], e["ts"][:16]) for _s, e in hits)
+            return CommandResult(True, "找到%d条关于「%s」的：%s" % (len(hits), kw[:12], lines[:240]),
+                                 "memory_search")
+        return None
 
     def _h_clipboard(self, t, p):
         if not any(k in p for k in ("剪贴板", "复制的内容", "复制了什么")):
@@ -295,41 +354,42 @@ class LocalCommands:
 
 
 if __name__ == "__main__":
-    print("=== 本地指令自检（除音量/程序外都会真执行；音量与打开程序用 dry_run 只判断计划）===")
-    cmds = LocalCommands(dry_run=False)
-    dry = LocalCommands(dry_run=True)
+    print("=== 本地指令自检（音量/打开程序用 dry_run 只判断计划；记事与记忆用临时文件）===")
+    import tempfile
+    import shutil
+    from core.memory import MemoryStore
+
+    tmpdir = tempfile.mkdtemp(prefix="cmd_selftest_")
+    mem = MemoryStore(path=os.path.join(tmpdir, "memory.json"))
+    cmds = LocalCommands(memory=mem, dry_run=False)
+    dry = LocalCommands(memory=mem, dry_run=True)
 
     print("\n【1】匹配与计划（dry_run，不真的调音量/开程序）")
     cases = [
         "声音大一点", "声音小一点", "静音", "取消静音",
         "打开记事本", "打开计算器", "打开百度", "打开微信",
         "记一下 明天早上八点吃降压药",
-        "读一下待办", "剪贴板里是什么", "现在几点", "今天几号",
+        "记住 我女儿叫小芳",
+        "读一下记事", "查一下 降压药", "今天记了什么", "记了多少条",
+        "剪贴板里是什么", "现在几点", "今天几号",
         "你能做什么",
         "这个药一天吃几次",
     ]
     for c in cases:
         res = dry.try_handle(c)
         if res.handled:
-            print("  %-24s -> 本地处理 [%s] 计划=%s" % (c, res.action, dry.last_plan))
+            print("  %-26s -> 本地 [%s] 计划=%s" % (c, res.action, dry.last_plan))
             dry.last_plan = ""
         else:
-            print("  %-24s -> 交给大模型" % c)
+            print("  %-26s -> 交给大模型" % c)
 
-    print("\n【2】真执行的安全指令（时间 / 记事 / 读记事）")
+    print("\n【2】真执行：时间 / 记日志 / 记事实 / 回看 / 检索")
     for c in ["现在几点", "今天几号"]:
-        res = cmds.try_handle(c)
-        print("  %-16s -> %s" % (c, res.reply))
-    # 用临时文件测试记事，避免污染真实待办
-    import tempfile
-    tmp_notes = os.path.join(tempfile.mkdtemp(prefix="cmd_selftest_"), "notes.json")
-    c2 = LocalCommands(notes_path=tmp_notes)
-    print("  %-16s -> %s" % ("记一下 自检条目", c2.try_handle("记一下 自检条目").reply))
-    print("  %-16s -> %s" % ("读一下待办", c2.try_handle("读一下待办").reply))
-    print("  %-16s -> %s" % ("清空记事", c2.try_handle("清空记事").reply))
-    print("  %-16s -> %s" % ("再读一次", c2.try_handle("读一下待办").reply))
-    import shutil
-    shutil.rmtree(os.path.dirname(tmp_notes), ignore_errors=True)
+        print("  %-20s -> %s" % (c, cmds.try_handle(c).reply))
+    for c in ["记一下 今天血压 130/85", "记一下 下午去公园走了四十分钟",
+              "记住 我女儿叫小芳", "读一下记事", "查一下 血压",
+              "今天记了什么", "记了多少条"]:
+        print("  %-20s -> %s" % (c, cmds.try_handle(c).reply))
 
     print("\n【3】安全性：未知程序必须被拒绝（不能执行）")
     res = dry.try_handle("打开 C:\\Windows\\System32\\cmd.exe")
@@ -337,8 +397,7 @@ if __name__ == "__main__":
     print("  判定: %s" % ("通过（拒绝了未知目标）" if res.action == "open_rejected" else "不通过！"))
 
     print("\n【4】截屏能力（只检查能否取到屏幕，不调用视觉模型）")
-    img, err = LocalCommands()._grab_screen()
-    if err:
-        print("  截屏失败：%s" % err)
-    else:
-        print("  截屏成功：%dx%d" % (img.shape[1], img.shape[0]))
+    img, err = LocalCommands(memory=mem)._grab_screen()
+    print("  截屏失败：%s" % err if err else "  截屏成功：%dx%d" % (img.shape[1], img.shape[0]))
+
+    shutil.rmtree(tmpdir, ignore_errors=True)

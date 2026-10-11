@@ -190,6 +190,8 @@ class MainWindow(QWidget):
         self.subtitle_window = None
         self.tracker = None          # 手势识别（HandTracker）
         self._reply_open = False     # 是否正在流式渲染一条回复（决定要不要先插「助手：」）
+        self._mem_view = None        # 引擎未启动时用来查看历史记忆
+        self._tick = 0
 
         self.font_size = UI_FONT_SIZE
         self.init_ui()
@@ -313,6 +315,37 @@ class MainWindow(QWidget):
         th.addWidget(self.btn_send)
         tv.addLayout(th)
         left.addWidget(card_text)
+
+        # ---- 日志与记忆 ----
+        card_mem = QFrame(self)
+        card_mem.setObjectName("card")
+        mv = QVBoxLayout(card_mem)
+        mv.setContentsMargins(18, 14, 18, 16)
+        mv.setSpacing(8)
+        lbl_mem = QLabel("日志与记忆", card_mem)
+        lbl_mem.setObjectName("cardTitle")
+        mv.addWidget(lbl_mem)
+        self.lbl_memory = QLabel("已记 0 条", card_mem)
+        self.lbl_memory.setObjectName("hint")
+        mv.addWidget(self.lbl_memory)
+        mh = QHBoxLayout()
+        mh.setSpacing(10)
+        self.btn_journal = QPushButton("查看日志", card_mem)
+        self.btn_journal.setMinimumHeight(44)
+        self.btn_journal.clicked.connect(self.on_show_journal)
+        mh.addWidget(self.btn_journal, 1)
+        self.btn_forget = QPushButton("清空记事", card_mem)
+        self.btn_forget.setMinimumHeight(44)
+        self.btn_forget.clicked.connect(self.on_clear_logs)
+        mh.addWidget(self.btn_forget, 1)
+        mv.addLayout(mh)
+        note_mem = QLabel("说「记一下 今天血压 130/85」会带时间记下来；"
+                          "说「记住 我女儿叫小芳」会记成长期事实，之后问起它能答上来。"
+                          "内容只存在本机文件里，不上传。", card_mem)
+        note_mem.setObjectName("hint")
+        note_mem.setWordWrap(True)
+        mv.addWidget(note_mem)
+        left.addWidget(card_mem)
 
         # ================= 右栏 =================
         right = QVBoxLayout()
@@ -600,10 +633,102 @@ class MainWindow(QWidget):
     def update_level(self):
         if self.engine is None or self.engine.listener is None:
             self.level.setValue(0)
+        else:
+            level = self.engine.listener.get_level()
+            # 麦克风 RMS 通常在 0~0.3；映射到 0~100 并做上限保护
+            self.level.setValue(int(max(0.0, min(1.0, level / 0.30)) * 100))
+        # 记忆条数不必每 120ms 刷新（要读文件），约每 2 秒更新一次
+        self._tick = (self._tick + 1) % 16
+        if self._tick == 0:
+            self._update_memory_label()
+
+    # -------------------- 日志与记忆 --------------------
+
+    def _memory(self):
+        """
+        取记忆库：引擎在跑就用引擎的（能看到它刚记的内容）；
+        引擎没启动也能查看历史，所以另建一个只读实例并重新读盘。
+        """
+        if self.engine is not None and getattr(self.engine, "memory", None) is not None:
+            return self.engine.memory
+        from core.memory import MemoryStore
+        if self._mem_view is None:
+            self._mem_view = MemoryStore()
+        else:
+            self._mem_view.load()
+        return self._mem_view
+
+    def _update_memory_label(self):
+        try:
+            s = self._memory().stats()
+            self.lbl_memory.setText("已记 %d 条（日志 %d / 关于我 %d / 对话 %d）"
+                                    % (s["total"], s["log"], s["fact"], s["chat"]))
+        except Exception:
+            pass
+
+    def on_show_journal(self):
+        mem = self._memory()
+        kind_label = {"log": "日志", "fact": "关于我", "chat": "对话"}
+        lines = []
+        for e in reversed(mem.entries[-300:]):
+            lines.append("[%s] %-4s %s" % (e.get("ts", "")[:16],
+                                           kind_label.get(e.get("kind"), e.get("kind")),
+                                           e.get("text", "")))
+            if e.get("reply"):
+                lines.append("            当时回答：%s" % e["reply"][:70])
+        if not lines:
+            lines = ["（还没有任何记录）", "",
+                     "试试说：记一下 今天血压 130/85",
+                     "或者说：记住 我女儿叫小芳",
+                     "然后问：我女儿叫什么"]
+        mem.save()      # 确保文件存在，方便"打开所在文件夹"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("日志与记忆")
+        dlg.resize(860, 620)
+        v = QVBoxLayout(dlg)
+        view = QTextEdit(dlg)
+        view.setReadOnly(True)
+        view.setPlainText("\n".join(lines))
+        v.addWidget(view)
+        info = QLabel("存放位置：%s（只在本机，不上传）" % mem.path, dlg)
+        info.setObjectName("hint")
+        info.setWordWrap(True)
+        v.addWidget(info)
+        btns = QHBoxLayout()
+        btn_open = QPushButton("打开所在文件夹", dlg)
+        btn_open.clicked.connect(lambda: self._open_folder(os.path.dirname(mem.path)))
+        btns.addWidget(btn_open)
+        btns.addStretch(1)
+        box = QDialogButtonBox(QDialogButtonBox.Close, dlg)
+        box.button(QDialogButtonBox.Close).setText("关闭")
+        box.rejected.connect(dlg.reject)
+        box.accepted.connect(dlg.accept)
+        btns.addWidget(box)
+        v.addLayout(btns)
+        dlg.exec_()
+
+    @staticmethod
+    def _open_folder(path):
+        try:
+            os.makedirs(path, exist_ok=True)
+            os.startfile(path)
+        except Exception:
+            pass
+
+    def on_clear_logs(self):
+        mem = self._memory()
+        n = mem.count("log")
+        if n == 0:
+            QMessageBox.information(self, "提示", "还没有记过日志。")
             return
-        level = self.engine.listener.get_level()
-        # 麦克风 RMS 通常在 0~0.3；映射到 0~100 并做上限保护
-        self.level.setValue(int(max(0.0, min(1.0, level / 0.30)) * 100))
+        ret = QMessageBox.question(self, "确认", "要清空 %d 条日志吗？\n"
+                                                "（关于您的事实和对话记录会保留）" % n,
+                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret == QMessageBox.Yes:
+            mem.clear("log")
+            self._update_memory_label()
+            self.on_status("已清空 %d 条日志" % n)
 
     # -------------------- 打字输入 --------------------
 

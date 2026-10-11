@@ -189,8 +189,17 @@ COMMAND_SITE_WHITELIST = {
 # 每按一次音量键约改变 2%，这里设按几次（5 次≈10%），避免一下调太多
 COMMAND_VOLUME_KEY_PRESSES = 5
 
-# 记事（待办）存放位置
+# 记事（待办）存放位置（旧字段，保留兼容；实际已由记忆模块统一管理）
 NOTES_PATH = os.path.join(PROJECT_ROOT, "data", "notes.json")
+
+# ============ 记忆 / 日志助手 ============
+# 纯本地 JSON：数据留在用户自己电脑上，不联网、不依赖向量数据库。
+# 检索用字符二元组重合度（中文无需分词器），数据量大到上万条再考虑 embedding。
+MEMORY_ENABLED = True
+MEMORY_PATH = os.path.join(PROJECT_ROOT, "data", "memory.json")
+MEMORY_MAX_ENTRIES = 2000      # 超出后只保留最近这么多条，防止文件无限增长
+MEMORY_CONTEXT_ITEMS = 4       # 每次对话最多注入几条相关记忆
+CHAT_LOG_ENABLED = True        # 每轮对话自动留档，于是「今天聊了什么」也答得出来
 
 # ============ 回声消除（AEC） ============
 # 用 WASAPI 回环采集"系统正在播放的声音"作为参考信号，与麦克风信号做自适应抵消。

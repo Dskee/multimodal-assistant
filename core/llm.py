@@ -104,13 +104,17 @@ class LLM:
         except Exception as e:
             return "", f"大模型调用失败: {str(e)}"
 
-    def chat_stream(self, user_text, on_chunk=None, context=None, concise_hint=None):
+    def chat_stream(self, user_text, on_chunk=None, context=None, concise_hint=None,
+                    memory_context=None):
         """
         流式对话（一个 token 一个 token 接收，实时显示）
         :param user_text: 用户输入
         :param on_chunk: 回调函数，每收到一个 token 就调用一次，参数是 token 字符串
         :param context: 联网搜索结果等参考资料（可选），会拼进本轮用户消息
         :param concise_hint: 简洁回答提示（可选），如 100 表示要求回答不超过 100 字
+        :param memory_context: 长期记忆/日志检索结果（可选），措辞与联网搜索不同：
+                               记忆是"用户自己的记录"，要允许模型自然地引用，
+                               但无关时不要主动提起
         :return: (完整回复文本, 错误信息)
         """
         if not self.api_key:
@@ -124,6 +128,16 @@ class LLM:
                     "【联网搜索结果】请优先依据以下资料回答用户问题，"
                     "资料不足或与问题无关时如实说明，不要编造。\n"
                     + context
+                    + "\n\n【用户问题】\n"
+                    + messages[-1]["content"]
+                )
+            # 长期记忆：用户自己记过的内容，允许自然引用
+            if memory_context:
+                messages[-1]["content"] = (
+                    "【关于这位用户的记忆】以下是他此前记下或说过的内容，"
+                    "可以在需要时自然地用上（比如他问『我上次记的…』）；"
+                    "与本次问题无关就不要提起，也不要逐条复述。\n"
+                    + memory_context
                     + "\n\n【用户问题】\n"
                     + messages[-1]["content"]
                 )

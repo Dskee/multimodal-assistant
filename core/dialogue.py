@@ -37,6 +37,7 @@ from config import (
     TTS_FILLER_ENABLED, TTS_FILLERS, TTS_CONCISE_HINT_CHARS,
     CONFIRM_ENABLED, CONFIRM_KEYWORDS, CONFIRM_YES, CONFIRM_NO,
     CONFIRM_TIMEOUT_SECONDS, CONFIRM_MAX_ANSWER_CHARS,
+    MEMORY_ENABLED, CHAT_LOG_ENABLED,
 )
 
 # 状态常量（界面据此显示"聆听中/识别中/思考中/播报中"）
@@ -285,33 +286,51 @@ class SpeechPlayer:
         tts = TextToSound(provider=self.provider, voice=self.voice,
                           api_key=self.api_key, rate=self.rate)
 
-        while not self._stop.is_set():
-            with self._cv:
-                while not self._q and not self._producing_done and not self._interrupted.is_set():
-                    self._cv.wait(0.1)
+        # 整个播报线程复用**一个**事件循环。
+        # 早期写法是每句 asyncio.run(...)——每句都新建再关闭一个循环，
+        # 而 aiohttp 的传输对象要到垃圾回收时才关闭，那时循环已经关了，
+        # 于是解释器退出前会打印一串 "RuntimeError: Event loop is closed" 的
+        # traceback（无害，但演示时看着像程序崩了）。
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            while not self._stop.is_set():
+                with self._cv:
+                    while not self._q and not self._producing_done and not self._interrupted.is_set():
+                        self._cv.wait(0.1)
+                    if self._interrupted.is_set():
+                        break
+                    if not self._q and self._producing_done:
+                        break
+                    sentence = self._q.pop(0)
+
+                try:
+                    audio = loop.run_until_complete(asyncio.wait_for(
+                        tts.run(sentence), timeout=TTS_TIMEOUT_SECONDS))
+                except Exception as e:
+                    self._error("语音合成失败: %s" % str(e)[:80])
+                    continue
+                if not audio:
+                    self._error("语音合成返回空音频")
+                    continue
                 if self._interrupted.is_set():
                     break
-                if not self._q and self._producing_done:
-                    break
-                sentence = self._q.pop(0)
 
+                if self.first_audio_ms is None:
+                    self.first_audio_ms = (time.time() - self._t_begin) * 1000.0
+                self.spoken_sentences += 1
+                self.spoken_chars += len(sentence)
+                self._play_and_wait(audio)
+        finally:
+            # 给 aiohttp 一点时间正常收尾，再关循环，避免退出时刷 traceback
             try:
-                audio = asyncio.run(asyncio.wait_for(
-                    tts.run(sentence), timeout=TTS_TIMEOUT_SECONDS))
-            except Exception as e:
-                self._error("语音合成失败: %s" % str(e)[:80])
-                continue
-            if not audio:
-                self._error("语音合成返回空音频")
-                continue
-            if self._interrupted.is_set():
-                break
-
-            if self.first_audio_ms is None:
-                self.first_audio_ms = (time.time() - self._t_begin) * 1000.0
-            self.spoken_sentences += 1
-            self.spoken_chars += len(sentence)
-            self._play_and_wait(audio)
+                loop.run_until_complete(asyncio.sleep(0.1))
+            except Exception:
+                pass
+            try:
+                loop.close()
+            except Exception:
+                pass
 
         self._set_playing(False)
         self._done.set()
@@ -417,11 +436,14 @@ class DialogueEngine:
         self.stt = SoundToText(api_key=api_key)
         self.llm = LLM(api_key=api_key)
 
-        # 本地指令（免手操作电脑）：自己持一个视觉实例，供"读屏幕文字"使用
+        # 本地指令（免手操作电脑）+ 记忆/日志：共用同一个记忆库
         from core.vision import ImageAnalyzer
         from core.commands import LocalCommands
+        from core.memory import MemoryStore
         self.analyzer = ImageAnalyzer(api_key=api_key)
-        self.commands = LocalCommands(analyzer=self.analyzer, api_key=api_key)
+        self.memory = MemoryStore()
+        self.commands = LocalCommands(analyzer=self.analyzer, api_key=api_key,
+                                      memory=self.memory)
         if system_prompt:
             self.llm.system_prompt = system_prompt
 
@@ -480,20 +502,30 @@ class DialogueEngine:
                 pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
             tts = TextToSound(provider=DEFAULT_TTS_PROVIDER, voice=self.player.voice,
                               api_key=self.api_key, rate=self.player.rate)
-            for i, text in enumerate(TTS_FILLERS):
-                audio = asyncio.run(asyncio.wait_for(tts.run(text),
-                                                     timeout=TTS_TIMEOUT_SECONDS))
-                if not audio:
-                    continue
-                path = os.path.join(TEMP_DIR, "filler_%d.mp3" % i)
-                os.makedirs(TEMP_DIR, exist_ok=True)
-                with open(path, "wb") as f:
-                    f.write(audio)
+            # 同样复用一个事件循环（理由见 SpeechPlayer._run 的注释）
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                for i, text in enumerate(TTS_FILLERS):
+                    audio = loop.run_until_complete(asyncio.wait_for(
+                        tts.run(text), timeout=TTS_TIMEOUT_SECONDS))
+                    if not audio:
+                        continue
+                    path = os.path.join(TEMP_DIR, "filler_%d.mp3" % i)
+                    os.makedirs(TEMP_DIR, exist_ok=True)
+                    with open(path, "wb") as f:
+                        f.write(audio)
+                    try:
+                        seconds = pygame.mixer.Sound(path).get_length()
+                    except Exception:
+                        seconds = 1.2
+                    self._fillers.append((path, float(seconds)))
+            finally:
                 try:
-                    seconds = pygame.mixer.Sound(path).get_length()
+                    loop.run_until_complete(asyncio.sleep(0.1))
                 except Exception:
-                    seconds = 1.2
-                self._fillers.append((path, float(seconds)))
+                    pass
+                loop.close()
         except Exception as e:
             self._emit(self.on_status, "即时应答音预合成失败（不影响使用）：%s" % str(e)[:60])
 
@@ -721,6 +753,9 @@ class DialogueEngine:
                 # 应答音已在识别之前播过（见上面 kind == "audio" 分支）
                 reply = self._respond(text, voice=(kind == "audio"))
                 if reply:
+                    # 对话自动留档：于是"我今天聊了什么"也答得出来
+                    if CHAT_LOG_ENABLED:
+                        self.memory.add_chat(text, reply)
                     self._emit(self.on_reply, reply)
                     self._emit(self.on_subtitle, ("助理", reply))
                     self.stats["turns"] += 1
@@ -779,9 +814,14 @@ class DialogueEngine:
         if self.enable_web_search:
             context = self._web_search(text)
 
+        # 记忆注入：把"关于用户的事实"和可能相关的历史记录带给大模型，
+        # 于是"我上次血压多少""我女儿叫什么"这类问题才答得上来。
+        mem_ctx = self.memory.context_for(text) if MEMORY_ENABLED else ""
+
         reply, err = self.llm.chat_stream(
             text, on_chunk=on_chunk, context=context,
-            concise_hint=(TTS_CONCISE_HINT_CHARS if voice else None))
+            concise_hint=(TTS_CONCISE_HINT_CHARS if voice else None),
+            memory_context=mem_ctx)
         for sentence in splitter.flush():
             self.player.push(sentence)
         self.player.end()
