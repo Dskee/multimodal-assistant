@@ -34,7 +34,7 @@ from config import (
     TTS_LOCAL_SERVICE, DEFAULT_TTS_PROVIDER, DEFAULT_LOCAL_VOICE,
     DEFAULT_SPEECH_RATE, TTS_TIMEOUT_SECONDS, TTS_MAX_TEXT_CHARS,
     TTS_STREAM_BY_SENTENCE, TTS_SENTENCE_MIN_CHARS, TTS_SOFT_CUT_MIN_CHARS,
-    TTS_FILLER_ENABLED, TTS_FILLERS,
+    TTS_FILLER_ENABLED, TTS_FILLERS, TTS_CONCISE_HINT_CHARS,
     CONFIRM_ENABLED, CONFIRM_KEYWORDS, CONFIRM_YES, CONFIRM_NO,
     CONFIRM_TIMEOUT_SECONDS, CONFIRM_MAX_ANSWER_CHARS,
 )
@@ -416,6 +416,12 @@ class DialogueEngine:
         self.api_key = api_key
         self.stt = SoundToText(api_key=api_key)
         self.llm = LLM(api_key=api_key)
+
+        # 本地指令（免手操作电脑）：自己持一个视觉实例，供"读屏幕文字"使用
+        from core.vision import ImageAnalyzer
+        from core.commands import LocalCommands
+        self.analyzer = ImageAnalyzer(api_key=api_key)
+        self.commands = LocalCommands(analyzer=self.analyzer, api_key=api_key)
         if system_prompt:
             self.llm.system_prompt = system_prompt
 
@@ -444,7 +450,8 @@ class DialogueEngine:
 
         # 统计
         self.stats = {"asr_ms": 0.0, "llm_first_ms": 0.0, "first_audio_ms": 0.0,
-                      "filler_ms": 0.0, "turns": 0, "barge_ins": 0, "confirmations": 0}
+                      "filler_ms": 0.0, "turns": 0, "barge_ins": 0, "confirmations": 0,
+                      "local_commands": 0}
 
         # 确认式交互：等待用户对"关键信息复述"的答复
         self._pending_confirm = None
@@ -652,6 +659,14 @@ class DialogueEngine:
             self._busy = True
             try:
                 if kind == "audio":
+                    # 即时应答音必须放在**识别之前**。
+                    # 识别是整条链路里抖动最大的一环（实测一段 4.4 秒录音，
+                    # 识别耗时从 0.3 秒到 14 秒以上都出现过）。
+                    # 放在识别之后，用户就要对着空气干等十几秒——那就完全失去了
+                    # "让它立刻出声安抚用户"的意义（这个位置错误是整体联调时才暴露的）。
+                    t_fill = time.time()
+                    self._speak_filler()
+                    self.stats["filler_ms"] = (time.time() - t_fill) * 1000.0
                     text = self._transcribe(payload)
                 else:
                     text = payload
@@ -675,6 +690,20 @@ class DialogueEngine:
                         continue
                     # 超时或答非所问：当作新的一句话正常往下走
 
+                # ---- 本地指令优先：免手操作电脑（不过大模型，立刻执行）----
+                # 必须放在"确认式交互"之前：像「记一下 明天买降压药」这类句子含"药"字，
+                # 若先走确认，就会出现"您是说：记一下 明天买降压药，对吗？"这种荒唐对话。
+                cmd = self.commands.try_handle(text)
+                if cmd.handled:
+                    self._emit(self.on_user_text, text)
+                    self._emit(self.on_subtitle, ("用户", text))
+                    self._emit(self.on_reply, cmd.reply)
+                    self._emit(self.on_subtitle, ("我", cmd.reply))
+                    self.stats["local_commands"] += 1
+                    self.stats["turns"] += 1
+                    self._speak_once(cmd.reply)
+                    continue
+
                 self._emit(self.on_user_text, text)
                 self._emit(self.on_subtitle, ("用户", text))
 
@@ -689,12 +718,8 @@ class DialogueEngine:
                     self._speak_once(prompt)
                     continue
 
-                # 语音输入才播"即时应答音"：打字输入的用户不需要被安抚
-                if kind == "audio":
-                    t_fill = time.time()
-                    self._speak_filler()
-                    self.stats["filler_ms"] = (time.time() - t_fill) * 1000.0
-                reply = self._respond(text)
+                # 应答音已在识别之前播过（见上面 kind == "audio" 分支）
+                reply = self._respond(text, voice=(kind == "audio"))
                 if reply:
                     self._emit(self.on_reply, reply)
                     self._emit(self.on_subtitle, ("助理", reply))
@@ -730,8 +755,12 @@ class DialogueEngine:
         self._emit(self.on_subtitle, ("系统", "没听清，请再说一次"))
         return ""
 
-    def _respond(self, text):
-        """大模型流式回复 + 分句流式播报"""
+    def _respond(self, text, voice=False):
+        """
+        大模型流式回复 + 分句流式播报
+        :param voice: 是否来自语音输入。语音场景要加简洁约束——
+                      实测不加会输出长篇回答，播报一次长达 34 秒，对老人是负担。
+        """
         self._set_state(STATE_THINKING)
         splitter = SentenceSplitter()
         self.player.begin()
@@ -750,8 +779,9 @@ class DialogueEngine:
         if self.enable_web_search:
             context = self._web_search(text)
 
-        reply, err = self.llm.chat_stream(text, on_chunk=on_chunk, context=context,
-                                          concise_hint=None)
+        reply, err = self.llm.chat_stream(
+            text, on_chunk=on_chunk, context=context,
+            concise_hint=(TTS_CONCISE_HINT_CHARS if voice else None))
         for sentence in splitter.flush():
             self.player.push(sentence)
         self.player.end()

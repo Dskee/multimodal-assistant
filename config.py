@@ -85,7 +85,17 @@ TTS_SILICONFLOW_VOICE = "FunAudioLLM/CosyVoice2-0.5B:alex"
 # ============ 大模型参数 ============
 LLM_TEMPERATURE = 0.7
 LLM_MAX_TOKENS = 300          # 语音场景回答要短，但 150 容易截断，取 300
-LLM_SYSTEM_PROMPT = "你是一个助手"
+# 系统提示词：面向老年用户的语音助手。
+# 必须明确约束"会被读出来、要短、不要 markdown"——否则模型会输出长篇带列表的回答，
+# 实测出现过一次播报长达 34 秒（21s→55s）的情况，对老人是明显负担。
+LLM_SYSTEM_PROMPT = (
+    "你是面向老年人的语音助手。回答要短、口语化，一次说清一件事，通常两三句就够。"
+    "不要使用列表符号、编号、markdown 或表情符号，因为你的回答会被读出来。"
+    "如果用户说得不清楚，可以礼貌地问一句；不确定的事就说不确定，不要编造。"
+)
+
+# 语音场景的简洁提示（会附加在本轮用户消息后）
+TTS_CONCISE_HINT_CHARS = 90
 
 # 是否让模型"思考"（推理模型专用）
 # 实测 Qwen3.5 系列思考开启时首字延迟 37 秒，关闭后 0.79 秒（差 47 倍）。
@@ -153,6 +163,34 @@ BARGE_IN_ENABLED = True
 BARGE_IN_ENERGY_RATIO = 3.0
 BARGE_IN_MIN_MS = 300         # 持续这么久才判定为打断（防误触发）
 BARGE_IN_GRACE_MS = 300       # 开始播报后的保护期，避免起播瞬间误判
+
+# ============ 本地指令：免手操作电脑 ============
+# 这些指令**不经过大模型**：要立刻执行，而且不能让模型幻觉决定"打开什么"。
+# 打开程序必须走白名单——不在表里的名字一律拒绝执行（安全优先）。
+COMMANDS_ENABLED = True
+
+# 允许打开的程序（名字 -> 可执行名/路径）。这些是中文别名，
+# 换到非中文 Windows 上请改成对应程序名。
+COMMAND_APP_WHITELIST = {
+    "记事本": "notepad",
+    "计算器": "calc",
+    "画图": "mspaint",
+    "写字板": "write",
+    "文件管理器": "explorer",
+}
+
+# 允许打开的常用网站
+COMMAND_SITE_WHITELIST = {
+    "百度": "https://www.baidu.com",
+    "淘宝": "https://www.taobao.com",
+    "京东": "https://www.jd.com",
+}
+
+# 每按一次音量键约改变 2%，这里设按几次（5 次≈10%），避免一下调太多
+COMMAND_VOLUME_KEY_PRESSES = 5
+
+# 记事（待办）存放位置
+NOTES_PATH = os.path.join(PROJECT_ROOT, "data", "notes.json")
 
 # ============ 回声消除（AEC） ============
 # 用 WASAPI 回环采集"系统正在播放的声音"作为参考信号，与麦克风信号做自适应抵消。

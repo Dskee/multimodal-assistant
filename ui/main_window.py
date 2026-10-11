@@ -189,6 +189,7 @@ class MainWindow(QWidget):
         self._threads = []
         self.subtitle_window = None
         self.tracker = None          # 手势识别（HandTracker）
+        self._reply_open = False     # 是否正在流式渲染一条回复（决定要不要先插「助手：」）
 
         self.font_size = UI_FONT_SIZE
         self.init_ui()
@@ -553,13 +554,32 @@ class MainWindow(QWidget):
         self.lbl_state.setStyleSheet("color:%s; font-weight:bold;" % color)
 
     def on_user_text(self, text):
+        self._reply_open = False
         self.chat.append("<b style='color:#1D4ED8;'>用户：</b>%s" % self._esc(text))
 
     def on_reply_chunk(self, token):
+        """
+        流式渲染回复。
+
+        必须**先插一行「助手：」再往里追加**：改造时一度去掉了这一步，
+        结果回答被直接粘在用户那句话后面，显示成
+        「用户：你好…能听见您说话…」（这类问题只有整体联调才暴露得出来）。
+        """
+        if not self._reply_open:
+            self.chat.append("<b style='color:#0F766E;'>助手：</b>")
+            self._reply_open = True
         self.chat.moveCursor(self.chat.textCursor().End)
         self.chat.insertPlainText(token)
 
     def on_reply(self, reply):
+        """
+        一条回复结束。
+        注意：如果这次没有走过 token 回调（例如本地指令是整段返回的），
+        回复内容只在这里出现，必须补渲染，否则用户看不到任何回答。
+        """
+        if not self._reply_open and reply:
+            self.chat.append("<b style='color:#0F766E;'>助手：</b>%s" % self._esc(reply))
+        self._reply_open = False
         self.chat.append("")
         self.chat.moveCursor(self.chat.textCursor().End)
 
