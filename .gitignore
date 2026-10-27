@@ -12,7 +12,7 @@ config.local.json
 temp/
 *.log
 logs/
-data/recordings/
+data/
 # 模型权重（二进制，按需下载，见 README）
 models/*.task
 models/*.onnx
